@@ -6,8 +6,9 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.contrib.auth import get_user_model
 from django.core.mail import send_mail
-from .models import Employee, PositionPermission
-from .serializers import EmployeeSerializer, PositionPermissionSerializer
+from .models import Employee, Role, Permission, EmployeeRole
+from .serializers import EmployeeSerializer, RoleSerializer, PermissionSerializer, EmployeeRoleSerializer
+from .permissions import HasPermission
 
 User = get_user_model()
 
@@ -16,22 +17,47 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        # 1. İstek atan kişinin veritabanındaki kullanıcı adını al
+        """Kullanıcının şirketine ait personelleri getir"""
         user = self.request.user
-        
-        # 2. Bu kullanıcının hangi şirkete (tenant) bağlı olduğunu bul
-        # (Senin modelinde user.tenant mı yoksa user.employee.tenant mı olduğunu Django kendisi çözecek)
         tenant = getattr(user, 'tenant', None) or getattr(getattr(user, 'employee', None), 'tenant', None)
         
-        # 3. Eğer şirketi bulabildiysek, sadece o şirketin personellerini getir
         if tenant:
             return Employee.objects.filter(tenant=tenant)
-            
-        # 4. Şirket bir şekilde bulunamadıysa (örneğin superuser ise), hata vermesin diye herkesi getir
         return Employee.objects.all()
+    
+    def check_permission(self, permission_code):
+        """Kullanıcının belirli izne sahip olup olmadığını kontrol et"""
+        user = self.request.user
+        if user.is_superuser or getattr(user, 'is_staff', False):
+            return True
+        
+        try:
+            employee = Employee.objects.get(email=user.email, tenant=user.tenant)
+            if hasattr(employee, 'role_assignment') and employee.role_assignment:
+                return employee.role_assignment.has_permission(permission_code)
+        except Employee.DoesNotExist:
+            # Şirket kurucusu = Tüm izinler
+            return True
+        
+        return False
 
-    # ➕ PERSONEL EKLEME (POST /api/personel/) -> 400 Hatasını bitiren yer
+    def list(self, request, *args, **kwargs):
+        """Personel listesini görüntüle (personel_goruntule izni gerekli)"""
+        if not self.check_permission('personel_goruntule'):
+            return Response(
+                {"error": "Bu işlem için yetkiniz yok. Personel listesini görüntüleme izni gereklidir."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        return super().list(request, *args, **kwargs)
+
     def create(self, request, *args, **kwargs):
+        """Personel ekle (personel_ekle izni gerekli)"""
+        if not self.check_permission('personel_ekle'):
+            return Response(
+                {"error": "Bu işlem için yetkiniz yok. Personel ekleme izni gereklidir."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
         data = request.data
         tenant = request.user.tenant
         email = data.get('email')
@@ -41,15 +67,14 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         if not email:
             return Response({"error": "E-posta alanı zorunludur."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Kullanıcı zaten var mı kontrolü
         if User.objects.filter(username=email).exists():
             return Response({"error": "Bu e-posta adresiyle zaten bir kullanıcı mevcut."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 10 haneli şifre üretimi
+        # Şifre üretimi
         alphabet = string.ascii_letters + string.digits
         generated_password = ''.join(secrets.choice(alphabet) for _ in range(10))
 
-        # 1. CustomUser Oluşturma
+        # CustomUser oluşturma
         user = User.objects.create_user(
             username=email,
             email=email,
@@ -61,7 +86,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             user.tenant = tenant
             user.save()
 
-        # 2. Employee Kaydı (Hiçbir serializer validasyonuna takılmadan düz insert)
+        # Employee kaydı
         employee = Employee.objects.create(
             tenant=tenant,
             first_name=first_name,
@@ -72,7 +97,18 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             salary=data.get('salary', 0) or 0
         )
 
-        # Terminale şifreyi yazdır
+        # İsteğe bağlı olarak varsayılan bir rol atayabilir
+        role_id = data.get('role_id')
+        if role_id:
+            try:
+                role = Role.objects.get(id=role_id, tenant=tenant)
+                EmployeeRole.objects.update_or_create(
+                    employee=employee,
+                    defaults={'role': role, 'assigned_by': request.user}
+                )
+            except Role.DoesNotExist:
+                pass
+
         print("\n" + "="*50)
         print(f"🎉 PERSONEL BAŞARIYLA KAYDEDİLDİ!")
         print(f"Kullanıcı: {email}")
@@ -97,28 +133,30 @@ Keyifli çalışmalar dileriz,
 {tenant.name} İnsan Kaynakları Yönetimi
         """
 
-        # E-posta bildirim gönderme
         try:
             send_mail(
                 subject=email_subject,
                 message=email_message,
-                from_email=None,  # settings.py içindeki DEFAULT_FROM_EMAIL'i otomatik kullanır
+                from_email=None,
                 recipient_list=[email],
-                fail_silently=False,  # Canlıda hatayı görebilmek için False yapıyoruz
+                fail_silently=False,
             )
         except Exception as mail_error:
-            # Eğer şifre veya port yanlışsa sunucu çökmez, terminale hatayı yazar
             print(f"❌ E-posta gönderilirken SMTP hatası oluştu: {mail_error}")
 
-        # React'ın beklediği eklenen personel verisi
         return Response(EmployeeSerializer(employee).data, status=status.HTTP_201_CREATED)
 
-    # ❌ PERSONEL SİLME (DELETE /api/personel/id/) -> 404 Hatasını bitiren yer
     def destroy(self, request, *args, **kwargs):
+        """Personel sil (personel_sil izni gerekli)"""
+        if not self.check_permission('personel_sil'):
+            return Response(
+                {"error": "Bu işlem için yetkiniz yok. Personel silme izni gereklidir."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
         try:
             instance = self.get_object()
             
-            # Personelin bağlı olduğu bir CustomUser varsa onu da sistemden temizleyelim
             if instance.email:
                 User.objects.filter(username=instance.email).delete()
                 
@@ -127,37 +165,97 @@ Keyifli çalışmalar dileriz,
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-    # 🔐 YETKİ KONTROLÜ (GET /api/personel/my-permissions/)
+    # 🔐 PERSONEL YETKİLERİNİ AL
     @action(detail=False, methods=['get'], url_path='my-permissions')
     def my_permissions(self, request):
+        """Giriş yapan kişinin tüm izinlerini getir"""
         user = request.user
+        
         if user.is_superuser or getattr(user, 'is_staff', False):
             return Response({
-                "position_name": "Sistem Yöneticisi", "can_view_employees": True, "can_add_employee": True,
-                "can_edit_employee": True, "can_delete_employee": True, "can_view_salary": True
+                "user_type": "Sistem Yöneticisi",
+                "role": None,
+                "permissions": [
+                    'personel_ekle', 'personel_sil', 'personel_goruntule',
+                    'muhasebe_goruntule', 'muhasebe_islem',
+                    'planlama_goruntule', 'planlama_islem'
+                ]
             })
 
         try:
             employee = Employee.objects.get(email=user.email, tenant=user.tenant)
-            user_position = employee.position
-            admin_keywords = ["müdür", "yönetici", "kurucu", "admin", "owner", "sahip", "ceo"]
-            if any(keyword in user_position.lower() for keyword in admin_keywords):
+            
+            # Eğer personele rol atanmışsa
+            if hasattr(employee, 'role_assignment') and employee.role_assignment and employee.role_assignment.role:
+                role = employee.role_assignment.role
+                permissions = [p.permission_code for p in role.permissions.all()]
                 return Response({
-                    "position_name": user_position, "can_view_employees": True, "can_add_employee": True,
-                    "can_edit_employee": True, "can_delete_employee": True, "can_view_salary": True
+                    "user_type": "Personel",
+                    "role": RoleSerializer(role).data,
+                    "permissions": permissions
                 })
         except Employee.DoesNotExist:
-            return Response({
-                "position_name": "Şirket Kurucusu", "can_view_employees": True, "can_add_employee": True,
-                "can_edit_employee": True, "can_delete_employee": True, "can_view_salary": True
-            })
+            # Personel kaydı yok = Şirket kurucusu
+            pass
+        
+        # Varsayılan: Şirket kurucusu (tüm izinler)
+        return Response({
+            "user_type": "Şirket Kurucusu",
+            "role": None,
+            "permissions": [
+                'personel_ekle', 'personel_sil', 'personel_goruntule',
+                'muhasebe_goruntule', 'muhasebe_islem',
+                'planlama_goruntule', 'planlama_islem'
+            ]
+        })
 
+    # 👤 PERSONELE ROL ATA
+    @action(detail=True, methods=['post'], url_path='assign-role')
+    def assign_role(self, request, pk=None):
+        """Belirli bir personele rol ata"""
+        if not self.check_permission('personel_ekle'):  # Benzer izin kontrol et
+            return Response(
+                {"error": "Bu işlem için yetkiniz yok."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        employee = self.get_object()
+        role_id = request.data.get('role_id')
+        
+        if not role_id:
+            return Response({"error": "role_id gereklidir."}, status=status.HTTP_400_BAD_REQUEST)
+        
         try:
-            permission = PositionPermission.objects.get(tenant=user.tenant, position_name=user_position)
-            serializer = PositionPermissionSerializer(permission)
-            return Response(serializer.data)
-        except PositionPermission.DoesNotExist:
+            role = Role.objects.get(id=role_id, tenant=employee.tenant)
+            employee_role, created = EmployeeRole.objects.update_or_create(
+                employee=employee,
+                defaults={'role': role, 'assigned_by': request.user}
+            )
+            
+            message = "Rol başarıyla atanmıştır." if created else "Rol başarıyla güncellenmiştir."
             return Response({
-                "position_name": user_position, "can_view_employees": True, "can_add_employee": False,
-                "can_edit_employee": False, "can_delete_employee": False, "can_view_salary": False
-            })
+                "message": message,
+                "employee_role": EmployeeRoleSerializer(employee_role).data
+            }, status=status.HTTP_200_OK)
+        except Role.DoesNotExist:
+            return Response({"error": "Rol bulunamadı."}, status=status.HTTP_404_NOT_FOUND)
+
+
+class RoleViewSet(viewsets.ModelViewSet):
+    """Rol yönetimi"""
+    serializer_class = RoleSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        """Kullanıcının şirketine ait rolleri getir"""
+        user = self.request.user
+        tenant = getattr(user, 'tenant', None) or getattr(getattr(user, 'employee', None), 'tenant', None)
+        
+        if tenant:
+            return Role.objects.filter(tenant=tenant)
+        return Role.objects.all()
+    
+    def perform_create(self, serializer):
+        """Rol oluştururken tenant'ı otomatik ata"""
+        tenant = self.request.user.tenant
+        serializer.save(tenant=tenant)
