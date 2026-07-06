@@ -13,8 +13,9 @@ urlpatterns = [
     path('api/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     
-    # Personel uygulamasının rotası:
+    # Personel uygulamasının rotası (Rol ve Personel yönetimi):
     path('api/personel/', include('personel.urls')), 
+    path('api/roles/', include('personel.urls')),
 
     path('api/', include('muhasebe.urls')),
 
